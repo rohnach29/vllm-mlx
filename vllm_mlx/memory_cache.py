@@ -769,10 +769,20 @@ class MemoryAwarePrefixCache:
 
         tokens_key = tuple(tokens)
 
+        # fetch() is deliberately lock-free (it sits on the request hot
+        # path), so entries can be evicted / removed / cleared by another
+        # thread between ANY two operations below.  Three rules keep every
+        # observable interleaving safe: (1) scan a snapshot of the sorted
+        # index, never the live list; (2) exchange discovered keys for
+        # entries with .get(), treating a vanished key as a miss; (3) LRU
+        # touches are best-effort (_touch).  An entry object obtained here
+        # stays valid even if concurrently evicted — eviction only drops
+        # the cache's references, not the object.
+
         # --- O(1) exact match ---
-        if tokens_key in self._entries:
-            entry = self._entries[tokens_key]
-            self._entries.move_to_end(tokens_key)
+        entry = self._entries.get(tokens_key)
+        if entry is not None:
+            self._touch(tokens_key)
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
             self._last_match_type = "exact"
@@ -788,7 +798,12 @@ class MemoryAwarePrefixCache:
         best_length = 0
         best_super: _CacheEntry | None = None
 
-        sorted_keys = self._sorted_keys
+        # Snapshot, not alias: concurrent removals mutate _sorted_keys in
+        # place, which both invalidates bisect/range bounds mid-scan
+        # (IndexError) and makes the scan logically incoherent.  The copy
+        # is N pointers (bounded by max_entries) — microseconds.  Keys in
+        # the snapshot may be stale; rule (2) above absorbs that.
+        sorted_keys = list(self._sorted_keys)
         if sorted_keys:
             # Find insertion point for tokens_key in the sorted list.
             # Keys that are prefixes of tokens_key or supersequences will be
@@ -806,7 +821,13 @@ class MemoryAwarePrefixCache:
                 # Check if cached_key is a prefix of tokens_key
                 if tokens_key[:cached_len] == cached_key:
                     if cached_len > best_length:
-                        best_match = self._entries[cached_key]
+                        candidate = self._entries.get(cached_key)
+                        if candidate is None:
+                            # Evicted since the snapshot.  Keep scanning:
+                            # a shorter prefix that is still present is a
+                            # recoverable hit, not a miss.
+                            continue
+                        best_match = candidate
                         best_length = cached_len
                     # Found best prefix — shorter entries can't be longer
                     break
@@ -824,7 +845,9 @@ class MemoryAwarePrefixCache:
                 # Check if tokens_key is a prefix of cached_key
                 if cached_key[: len(tokens_key)] == tokens_key:
                     if best_super is None or cached_len > len(best_super.tokens):
-                        best_super = self._entries[cached_key]
+                        candidate = self._entries.get(cached_key)
+                        if candidate is not None:
+                            best_super = candidate
                 else:
                     # Past the supersequence range
                     break
@@ -846,7 +869,7 @@ class MemoryAwarePrefixCache:
                 )
             elif excess > 0:
                 trimmed_cache = _trim_cache_offset(best_super.cache, excess)
-                self._entries.move_to_end(best_super.tokens)
+                self._touch(best_super.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
@@ -857,7 +880,7 @@ class MemoryAwarePrefixCache:
                 )
                 return trimmed_cache, []
             else:
-                self._entries.move_to_end(best_super.tokens)
+                self._touch(best_super.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
@@ -870,7 +893,7 @@ class MemoryAwarePrefixCache:
 
         # --- Prefix match ---
         if best_match is not None:
-            self._entries.move_to_end(best_match.tokens)
+            self._touch(best_match.tokens)
             self._stats.hits += 1
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
@@ -909,7 +932,10 @@ class MemoryAwarePrefixCache:
                         break
                     lcp = j + 1
                 if lcp > best_lcp_length:
-                    best_lcp_entry = self._entries[cached_key]
+                    candidate = self._entries.get(cached_key)
+                    if candidate is None:
+                        continue  # evicted since the snapshot
+                    best_lcp_entry = candidate
                     best_lcp_length = lcp
                     logger.debug(
                         f"[cache_fetch] LCP scan: cached_len={len(cached_key)} "
@@ -949,7 +975,7 @@ class MemoryAwarePrefixCache:
                 )
             else:
                 trimmed_cache = _trim_cache_offset(best_lcp_entry.cache, excess)
-                self._entries.move_to_end(best_lcp_entry.tokens)
+                self._touch(best_lcp_entry.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += best_lcp_length
                 remaining = tokens[best_lcp_length:]
@@ -1050,10 +1076,11 @@ class MemoryAwarePrefixCache:
                     elif key[0] != tokens_key[0]:
                         break
                 for key in to_remove:
+                    # Unindex before popping (see _evict_lru).
+                    self._remove_from_sorted(key)
                     old = self._entries.pop(key)
                     self._current_memory -= old.memory_bytes
                     self._stats.evictions += 1
-                    self._remove_from_sorted(key)
                     logger.debug(
                         f"[prefix_evict] removed {len(key)} tokens, "
                         f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
@@ -1091,6 +1118,20 @@ class MemoryAwarePrefixCache:
         if idx < len(self._sorted_keys) and self._sorted_keys[idx] == key:
             self._sorted_keys.pop(idx)
 
+    def _touch(self, tokens_key: tuple[int, ...]) -> None:
+        """Best-effort LRU touch for the lock-free ``fetch()`` path.
+
+        The entry may be evicted, removed, or cleared by another thread
+        between discovery and this touch.  A vanished key means there is
+        nothing left to protect from eviction, so doing nothing is the
+        accurate outcome — and the entry object the caller already holds
+        remains valid regardless.
+        """
+        try:
+            self._entries.move_to_end(tokens_key)
+        except KeyError:
+            pass
+
     def _evict_lru(self) -> None:
         """Evict the least recently used entry.
 
@@ -1101,10 +1142,26 @@ class MemoryAwarePrefixCache:
             if not self._entries:
                 return
 
-            # popitem(last=False) removes oldest entry (FIFO order = LRU)
-            tokens_key, entry = self._entries.popitem(last=False)
-            self._current_memory -= entry.memory_bytes
+            # Oldest entry first (FIFO order = LRU).  Unindex BEFORE
+            # popping: lock-free fetch() discovers entries through
+            # _sorted_keys, so the only safe intermediate state is
+            # "present but unfindable", never "advertised but gone".
+            #
+            # The peek retries because fetch()'s lock-free LRU touch
+            # (move_to_end) can invalidate the iterator mid-peek; the
+            # window is a couple of bytecodes, so a retry converges
+            # immediately.  A concurrent touch may also promote the entry
+            # we are about to evict — evicting a just-touched entry is a
+            # slightly stale LRU decision, not a correctness issue.
+            while True:
+                try:
+                    tokens_key = next(iter(self._entries))
+                    break
+                except RuntimeError:
+                    continue
             self._remove_from_sorted(tokens_key)
+            entry = self._entries.pop(tokens_key)
+            self._current_memory -= entry.memory_bytes
             self._stats.evictions += 1
             self._stats.entry_count = len(self._entries)
             self._stats.current_memory_bytes = self._current_memory
@@ -1131,20 +1188,23 @@ class MemoryAwarePrefixCache:
         """
         with self._memory_lock:
             tokens_key = tuple(tokens)
-            entry = self._entries.pop(tokens_key, None)
-            if entry is not None:
-                self._current_memory -= entry.memory_bytes
-                self._remove_from_sorted(tokens_key)
-                self._stats.entry_count = len(self._entries)
-                self._stats.current_memory_bytes = self._current_memory
-                return True
-            return False
+            if tokens_key not in self._entries:
+                return False
+            # Unindex before popping (see _evict_lru).
+            self._remove_from_sorted(tokens_key)
+            entry = self._entries.pop(tokens_key)
+            self._current_memory -= entry.memory_bytes
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
+            return True
 
     def clear(self) -> None:
         """Clear all cached entries."""
         with self._memory_lock:
-            self._entries.clear()
+            # Index first, then entries (see _evict_lru): clear() is every
+            # removal at once, and the same ordering rule applies.
             self._sorted_keys.clear()
+            self._entries.clear()
             self._current_memory = 0
             self._stats = CacheStats(max_memory_bytes=self._max_memory)
         logger.debug("Cache cleared")
@@ -1285,7 +1345,21 @@ class MemoryAwarePrefixCache:
         }
 
         saved = 0
-        for i, (tokens_key, entry) in enumerate(self._entries.items()):
+        # Snapshot before iterating: iterating the live dict without the
+        # lock races concurrent stores/evictions (RuntimeError: mutated
+        # during iteration).  The snapshot is built under _memory_lock so
+        # structural writers are excluded; the retry absorbs fetch()'s
+        # lock-free LRU touch, whose relink can invalidate even the
+        # snapshot copy's iterator (two-bytecode window, converges
+        # immediately).  The safetensors writes then run lock-free.
+        with self._memory_lock:
+            while True:
+                try:
+                    entries_snapshot = list(self._entries.items())
+                    break
+                except RuntimeError:
+                    continue
+        for i, (tokens_key, entry) in enumerate(entries_snapshot):
             entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
             try:
                 # Dequantize _QuantizedCacheWrapper layers before saving.

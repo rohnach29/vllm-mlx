@@ -555,3 +555,277 @@ class TestGetAvailableMemory:
             # Should return 0 when psutil not available
             # Note: This test may not work as expected due to import caching
             pass
+
+
+class TestLockFreeFetchVsRemovalRaces:
+    """Regressions for the fetch()-vs-removal races.
+
+    ``fetch()`` is lock-free while eviction / ``remove()`` / ``clear()``
+    mutate ``_entries`` and ``_sorted_keys`` in multiple steps, so a fetch
+    could observe half-finished removals: a sorted-index key whose entry
+    was already popped (``KeyError`` at discovery or at the LRU
+    ``move_to_end`` touch), or the live index list shrinking mid-scan
+    (``IndexError``).  The fix: removals unindex before popping, fetch
+    scans a snapshot of the index, and every dereference tolerates a
+    concurrently vanished key by degrading to a miss.
+    """
+
+    @staticmethod
+    def _make_cache(**cfg):
+        cfg.setdefault("max_memory_mb", 64)
+        cfg.setdefault("min_prefix_tokens", 1)
+        model = MagicMock()
+        return MemoryAwarePrefixCache(model, MemoryCacheConfig(**cfg))
+
+    @staticmethod
+    def _layer():
+        # Array-free layer object: estimator prices it at 0 bytes and
+        # store() keeps it as-is, which is all these tests need.
+        class _Layer:
+            pass
+
+        return [_Layer()]
+
+    def test_stale_index_key_degrades_to_miss_not_crash(self):
+        """A key present in _sorted_keys but missing from _entries (the
+        mid-removal state a lock-free fetch can observe) must produce a
+        miss at every discovery site — exact, prefix, supersequence, and
+        LCP — never a KeyError escaping the public fetch() API."""
+        cache = self._make_cache()
+        assert cache.store([1, 2, 3], self._layer())
+
+        # Simulate the torn state directly: entry gone, index stale.
+        del cache._entries[(1, 2, 3)]
+        assert (1, 2, 3) in cache._sorted_keys
+
+        # Exact + supersequence discovery.
+        got, remaining = cache.fetch([1, 2, 3])
+        assert got is None and remaining == [1, 2, 3]
+        # Prefix discovery (stale key is a strict prefix of the query).
+        got, remaining = cache.fetch([1, 2, 3, 9])
+        assert got is None and remaining == [1, 2, 3, 9]
+        # Supersequence discovery (query is a strict prefix of stale key).
+        got, remaining = cache.fetch([1, 2])
+        assert got is None and remaining == [1, 2]
+
+    def test_lru_touch_on_vanished_key_is_noop(self):
+        """The best-effort LRU touch must tolerate a key evicted between
+        discovery and the touch."""
+        cache = self._make_cache()
+        cache._touch((9, 9, 9))  # must not raise
+
+    def test_removal_paths_unindex_before_popping_entries(self):
+        """Every removal path must remove the key from the sorted index
+        BEFORE popping the entry: lock-free fetch() discovers entries
+        through the index, so 'advertised but gone' must never be an
+        observable state.  Verified by recording the operation order."""
+        from collections import OrderedDict
+
+        log = []
+
+        class _LoggingEntries(OrderedDict):
+            def pop(self, *args, **kwargs):
+                log.append("pop_entry")
+                return super().pop(*args, **kwargs)
+
+            def popitem(self, *args, **kwargs):
+                log.append("pop_entry")
+                return super().popitem(*args, **kwargs)
+
+            def clear(self):
+                log.append("pop_entry")
+                return super().clear()
+
+        class _LoggingIndex(list):
+            def clear(self):
+                log.append("unindex")
+                return super().clear()
+
+        def _instrument(cache):
+            new = _LoggingEntries()
+            new.update(cache._entries)
+            cache._entries = new
+            cache._sorted_keys = _LoggingIndex(cache._sorted_keys)
+            original = cache._remove_from_sorted
+
+            def logging_unindex(key):
+                log.append("unindex")
+                return original(key)
+
+            cache._remove_from_sorted = logging_unindex
+
+        # remove()
+        cache = self._make_cache()
+        cache.store([1, 2, 3], self._layer())
+        _instrument(cache)
+        assert cache.remove([1, 2, 3])
+        assert log == ["unindex", "pop_entry"]
+
+        # LRU eviction (max_entries=1 forces eviction on second store)
+        log.clear()
+        cache = self._make_cache(max_entries=1)
+        cache.store([1, 2, 3], self._layer())
+        _instrument(cache)
+        cache.store([4, 5, 6], self._layer())
+        assert log[:2] == ["unindex", "pop_entry"]
+
+        # clear()
+        log.clear()
+        cache = self._make_cache()
+        cache.store([1, 2, 3], self._layer())
+        _instrument(cache)
+        cache.clear()
+        assert log == ["unindex", "pop_entry"]
+
+    def test_concurrent_fetch_store_remove_clear_no_escaped_exceptions(self):
+        """Integration hammer: concurrent stores, fetches, removes, and
+        clears must never let an exception escape the public API — the
+        worst permitted outcome of any interleaving is a cache miss."""
+        import sys
+
+        cache = self._make_cache(max_entries=8)
+        errors = []
+        stop = time.monotonic() + 2.0
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-5)
+
+        def storer(base):
+            i = 0
+            while time.monotonic() < stop:
+                i += 1
+                key = [base, i % 13] + list(range(i % 7))
+                try:
+                    cache.store(key, self._layer())
+                except Exception as exc:  # pragma: no cover
+                    errors.append(("store", exc))
+
+        def fetcher(base):
+            i = 0
+            while time.monotonic() < stop:
+                i += 1
+                # Mix of exact, prefix-shaped, and divergent queries.
+                query = [base, i % 13] + list(range(i % 9))
+                try:
+                    cache.fetch(query)
+                except Exception as exc:
+                    errors.append(("fetch", exc))
+
+        def remover():
+            i = 0
+            while time.monotonic() < stop:
+                i += 1
+                try:
+                    cache.remove([i % 3, i % 13])
+                except Exception as exc:  # pragma: no cover
+                    errors.append(("remove", exc))
+                if i % 50 == 0:
+                    try:
+                        cache.clear()
+                    except Exception as exc:  # pragma: no cover
+                        errors.append(("clear", exc))
+
+        threads = (
+            [threading.Thread(target=storer, args=(b,)) for b in range(2)]
+            + [threading.Thread(target=fetcher, args=(b,)) for b in range(3)]
+            + [threading.Thread(target=remover)]
+        )
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            sys.setswitchinterval(old_interval)
+
+        assert errors == [], f"escaped exceptions: {errors[:5]}"
+
+    def test_prefix_subset_eviction_unindexes_before_popping(self):
+        """The prefix-subset eviction inside store() must follow the same
+        unindex-before-pop order as every other removal path."""
+        from collections import OrderedDict
+
+        log = []
+
+        class _LoggingEntries(OrderedDict):
+            def pop(self, *args, **kwargs):
+                log.append("pop_entry")
+                return super().pop(*args, **kwargs)
+
+        cache = self._make_cache()
+        cache.store([1, 2, 3], self._layer())
+
+        new = _LoggingEntries()
+        new.update(cache._entries)
+        cache._entries = new
+        original = cache._remove_from_sorted
+
+        def logging_unindex(key):
+            log.append("unindex")
+            return original(key)
+
+        cache._remove_from_sorted = logging_unindex
+
+        # Storing a supersequence evicts the strict-prefix entry.
+        assert cache.store([1, 2, 3, 4], self._layer(), evict_prefixes=True)
+        assert "pop_entry" in log, "prefix-subset eviction did not fire"
+        assert log.index("unindex") < log.index("pop_entry")
+
+    def test_ghost_longest_prefix_recovers_shorter_prefix(self):
+        """If the longest indexed prefix vanished mid-race, a shorter
+        prefix that is still fully present must be served — the torn
+        window should cost at most the delta, not the whole hit."""
+        cache = self._make_cache()
+        assert cache.store([1, 2, 3], self._layer())
+        assert cache.store([1, 2, 3, 4], self._layer(), evict_prefixes=False)
+
+        # Torn state: longest prefix's entry gone, index stale.
+        del cache._entries[(1, 2, 3, 4)]
+
+        got, remaining = cache.fetch([1, 2, 3, 4, 5])
+        assert got is not None, "shorter present prefix was not recovered"
+        assert remaining == [4, 5]
+
+    def test_save_to_disk_tolerates_concurrent_mutation(self, tmp_path):
+        """save_to_disk() must survive the entries dict mutating mid-
+        iteration (concurrent store/eviction, or fetch's lock-free LRU
+        touch relinking the OrderedDict).  Deterministic: the instrumented
+        dict injects one real mutation after the second item is yielded —
+        unfixed code lets the resulting RuntimeError escape the public
+        API; fixed code snapshots under the lock with a retry, so the
+        first attempt absorbs the mutation and the second succeeds."""
+        from collections import OrderedDict
+
+        # save_to_disk() returns before iterating when mlx_lm is absent,
+        # so the iteration under test only exists with mlx_lm installed.
+        pytest.importorskip("mlx_lm")
+
+        cache = self._make_cache()
+        for i in range(6):
+            cache.store([i, i + 1, i + 2], self._layer())
+
+        class _MutatingEntries(OrderedDict):
+            fired = False
+
+            def items(inner):
+                it = iter(super().items())
+
+                def gen():
+                    for n, kv in enumerate(it):
+                        yield kv
+                        if n == 1 and not inner.fired:
+                            inner.fired = True
+                            # Real mutation of the underlying dict —
+                            # invalidates every live iterator over it.
+                            inner[("injected", "mid", "iteration")] = kv[1]
+
+                return gen()
+
+        new = _MutatingEntries()
+        new.update(cache._entries)
+        cache._entries = new
+
+        # Must not raise; per-entry safetensors failures are fine (the
+        # fake layers aren't persistable), only escaped iteration errors
+        # are the bug.
+        cache.save_to_disk(str(tmp_path / "snap"))
+        assert new.fired, "instrumentation never triggered"
